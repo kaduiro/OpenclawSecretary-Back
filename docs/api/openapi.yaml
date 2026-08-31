@@ -1,0 +1,3904 @@
+openapi: 3.1.0
+info:
+  title: OpenClaw Mail Secretary API
+  version: 2.0.0
+  description: >
+    Canonical HTTPS REST API surface for clawd-on-desk Electron HUD,
+    openclaw-hud-gateway, and the private organization-scoped OpenClaw Cloud Run service.
+    The HUD uses only the IAP-protected gateway URL; it never calls the private
+    openclaw-api URL directly. Initial OAuth is browser navigation through the
+    gateway. The private API performs confidential Google OAuth code exchange
+    with the OAuth client secret from Secret Manager, stores the Gmail refresh
+    token in Secret Manager, and returns only short-lived Google ID tokens plus
+    sanitized claims to the HUD. The HUD never receives, sends, or persists
+    refresh tokens, access tokens, authorization codes, code verifiers, or
+    OAuth client secrets.
+servers:
+  - url: https://{gatewayHost}
+    variables:
+      gatewayHost:
+        default: openclaw-hud-gateway.example.run.app
+security:
+  - googleIdToken: []
+tags:
+  - name: health
+  - name: auth
+  - name: events
+  - name: mail
+  - name: calendar
+  - name: faq
+  - name: settings
+  - name: errors
+  - name: internal
+paths:
+  /livez:
+    get:
+      tags: [health]
+      summary: Platform liveness probe.
+      description: >
+        Cloud Run platform probe endpoint. It must not expose user, mail,
+        calendar, token, or database details. External calls still pass through
+        Cloud Run IAM when unauthenticated invocations are disabled.
+      security: []
+      operationId: getLiveness
+      responses:
+        "200":
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeResponse"
+
+  /readyz:
+    get:
+      tags: [health]
+      summary: Operational readiness probe.
+      description: >
+        Operational readiness endpoint. It may check internal dependencies but
+        must return only coarse readiness state and never expose user data,
+        tokens, secret names, or raw errors. External calls still pass through
+        Cloud Run IAM when unauthenticated invocations are disabled.
+      security: []
+      operationId: getReadiness
+      responses:
+        "200":
+          description: Service is ready for authenticated /v1 requests.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeResponse"
+        "503":
+          $ref: "#/components/responses/ProbeUnavailable"
+
+  /v1/health:
+    get:
+      tags: [health]
+      summary: Authenticated health check used by HUD heartbeat.
+      description: >
+        HUD-facing heartbeat. A valid Google ID token is required after the
+        request passes Cloud Run IAM. Unauthenticated external requests return
+        Cloud Run platform 403; Cloud Run startup/liveness probes must use
+        /livez instead.
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service and Cloud SQL are available.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/events:
+    get:
+      tags: [events]
+      summary: Poll event inbox for asynchronous HUD updates.
+      description: >
+        Returns events that have an event_inbox_recipients row for the
+        authenticated user's attendee_ref and whose recipient acked_at is null.
+        Results are ordered by createdAt ascending (oldest unacknowledged first).
+        The cursor is only a paging cursor and does not mark events as consumed.
+        HUD restart or cursor loss must not drop unacknowledged events;
+        an event becomes fully acknowledged only after every recipient row has
+        a non-null acked_at.
+      operationId: listEvents
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: >
+            Opaque paging cursor. Implementations should encode the last seen
+            createdAt and eventId so ordering is stable even when multiple
+            events share the same timestamp. The cursor does not acknowledge
+            or consume events.
+          schema:
+            type: string
+            example: "2026-06-03T10:00:00.000Z_evt-00000000-0000-0000-0000-000000000001"
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Event inbox page.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events, nextCursor]
+                additionalProperties: false
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Event"
+                  nextCursor:
+                    type: [string, "null"]
+                    example: "2026-06-03T10:00:00.000Z_evt-00000000-0000-0000-0000-000000000001"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/events/{eventId}/ack:
+    post:
+      tags: [events]
+      summary: Acknowledge an event after the HUD displays or processes it.
+      description: >
+        Idempotently sets acked_at only on the caller's
+        event_inbox_recipients row for this event. Duplicate acknowledgements
+        from the same caller return 200 with the same eventId. Acknowledging a
+        BU-shared event does not hide it from other recipients whose acked_at is
+        still null. Returns 403 when no recipient row exists for the caller's
+        attendee_ref. Fully acknowledged events are physically deleted only
+        after the ACK retention window.
+      operationId: acknowledgeEvent
+      parameters:
+        - $ref: "#/components/parameters/EventId"
+      responses:
+        "200":
+          description: Event acknowledged. Duplicate acknowledgements are idempotent.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, eventId, acknowledgedAt, fullyAcknowledged]
+                additionalProperties: false
+                properties:
+                  success:
+                    type: boolean
+                  eventId:
+                    type: string
+                  acknowledgedAt:
+                    type: string
+                    format: date-time
+                    description: acked_at stored on the caller's event_inbox_recipients row.
+                  fullyAcknowledged:
+                    type: boolean
+                    description: True only when every event_inbox_recipients row for this event has non-null acked_at.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/auth/start:
+    get:
+      tags: [auth]
+      summary: Start browser OAuth through the IAP-protected HUD gateway.
+      description: >
+        Browser navigation entrypoint used by the HUD for initial login.
+        The request is not a programmatic Bearer-token API call; it is protected
+        by the user's IAP browser session on the gateway. The gateway asks the
+        private API to create a short-lived OAuth auth session, then redirects
+        the browser to Google's authorization URL. The HUD supplies only a local
+        loopback return_uri. The HUD does not generate or store the OAuth
+        code_verifier and never receives the authorization code. It generates
+        a separate random handoff_verifier and sends only its S256 challenge.
+      operationId: startOAuth
+      security: []
+      parameters:
+        - name: return_uri
+          in: query
+          required: true
+          description: >
+            Exact HUD loopback receiver. Only numeric loopback hosts, ports
+            1024-65535, and path /callback are accepted. Userinfo, query,
+            fragment, localhost aliases, and external hosts are rejected.
+          schema:
+            type: string
+            format: uri
+            pattern: '^http://(127\.0\.0\.1|\[::1\]):(102[4-9]|10[3-9][0-9]|1[1-9][0-9]{2}|[2-9][0-9]{3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])/callback$'
+            example: "http://127.0.0.1:23456/callback"
+        - name: handoff_challenge
+          in: query
+          required: true
+          description: Base64url SHA-256 challenge for the HUD-held handoff_verifier.
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{43}$'
+      responses:
+        "302":
+          description: Redirect to Google authorization URL.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/auth/callback:
+    get:
+      tags: [auth]
+      summary: Google OAuth redirect URI handled by the HUD gateway.
+      description: >
+        Google redirects the browser here with code and state. The gateway
+        forwards code and state to the private API internal exchange endpoint.
+        The private API validates state, performs confidential token exchange
+        using the OAuth client secret from Secret Manager, verifies ID token
+        claims and stores the Gmail refresh token in Secret Manager. The
+        gateway returns a no-store transfer page that POSTs only a random
+        single-use handoffCode to the HUD loopback return_uri, never an ID
+        token or claims. The auth session binds return_uri, state, nonce, OAuth
+        PKCE verifier, and HUD handoff challenge; the code expires after 60 seconds.
+        The page uses Cache-Control: no-store, Referrer-Policy: no-referrer, and
+        a script-src 'nonce-*'; default-src 'none' CSP. No refresh token is
+        returned to the HUD.
+      operationId: oauthCallback
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: No-store browser handoff page for the HUD loopback listener.
+          content:
+            text/html:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/auth/handoff/redeem:
+    post:
+      tags: [auth]
+      summary: Redeem the loopback handoff code using the HUD-held verifier.
+      description: >
+        Pre-login endpoint hosted by the narrowly exposed auth-bootstrap
+        service. The HUD main process submits the single-use handoffCode and
+        original high-entropy handoffVerifier. The bootstrap service forwards
+        them using Bootstrap SA OIDC. The private API atomically consumes the
+        code, compares S256(verifier) to the bound challenge, and only then
+        returns a short-lived ID token. A lost response requires a new OAuth
+        flow; a consumed code is never made reusable.
+      operationId: redeemAuthHandoff
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HandoffRedeemRequest"
+      responses:
+        "200":
+          description: Single-use handoff redeemed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthHandoffResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/auth/id-token/refresh:
+    post:
+      tags: [auth]
+      summary: Refresh the HUD short-lived Google ID token without exposing refresh tokens.
+      description: >
+        Programmatic gateway API used by TokenManager before ID token expiry.
+        The HUD sends the current Google ID token in both Proxy-Authorization
+        and Authorization. The gateway passes IAP and forwards Authorization to
+        the private API while minting a fresh X-Serverless-Authorization token
+        with the gateway service account. The private API validates the current
+        ID token, uses the Secret Manager Gmail refresh token to obtain a new
+        Google ID token, verifies the new claims, and returns only the new
+        short-lived ID token plus sanitized claims.
+      operationId: refreshHudIdToken
+      responses:
+        "200":
+          description: New short-lived ID token issued to the HUD.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdTokenRefreshResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/auth/bind-subject:
+    post:
+      tags: [auth]
+      summary: Bind a pre-registered BU user on first verified login.
+      description: >
+        Verifies the Google ID token without requiring an existing subject,
+        hashes its normalized email, and atomically binds the subject to exactly
+        one pending_subject_bind user. Replays, email mismatches, and already
+        bound users fail closed.
+      operationId: bindFirstLoginSubject
+      responses:
+        "201":
+          description: Subject bound and user activated.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubjectBindResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /v1/auth/gmail-self-registration:
+    post:
+      tags: [auth]
+      summary: Register the caller's personal Workspace Gmail account.
+      description: >
+        Idempotently confirms the personal Workspace Gmail registration already
+        provisioned by the confidential OAuth exchange. The exchange validates
+        Google claims and BU address conflicts, generates attendee_ref, creates
+        the users row, and stores refresh-token/{attendee_ref} before returning
+        a usable HUD ID token. Unknown subjects are never admitted through the
+        normal application allowlist solely to call this endpoint (D-37).
+      operationId: registerPersonalGmailAccount
+      responses:
+        "201":
+          description: Personal Gmail account registered for the authenticated user.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GmailSelfRegistrationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /internal/auth/oauth-sessions:
+    post:
+      tags: [internal]
+      summary: Create a short-lived OAuth auth session for the gateway.
+      description: >
+        Gateway-to-private-API internal endpoint. The private API creates
+        state and code_verifier, stores them in a short-lived auth session, and
+        binds the exact return URI and HUD-provided handoff challenge before
+        returning a Google authorization URL. This endpoint is not directly
+        callable by the HUD.
+      operationId: createOAuthSession
+      security:
+        - gatewayOidcToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OAuthSessionCreateRequest"
+      responses:
+        "200":
+          description: OAuth auth session created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthSessionCreateResponse"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+
+  /internal/auth/oauth-exchange:
+    post:
+      tags: [internal]
+      summary: Confidentially exchange Google OAuth code and store refresh token.
+      description: >
+        Gateway-to-private-API internal endpoint. The private API validates
+        state, loads the stored code_verifier, exchanges the authorization code
+        at Google's token endpoint using the OAuth client secret from Secret
+        Manager, validates ID token claims, stores the Gmail refresh token in
+        Secret Manager, stores the short-lived ID token behind the bound
+        handoff challenge, and returns only a random one-time handoffCode.
+      operationId: exchangeOAuthCode
+      security:
+        - gatewayOidcToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OAuthExchangeRequest"
+      responses:
+        "200":
+          description: OAuth exchange completed and refresh token stored server-side.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthExchangeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+
+  /internal/auth/handoff/redeem:
+    post:
+      tags: [internal]
+      summary: Atomically redeem a handoff code. Invoked only by the gateway.
+      operationId: redeemInternalAuthHandoff
+      security:
+        - bootstrapOidcToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HandoffRedeemRequest"
+      responses:
+        "200":
+          description: Handoff consumed and ID token returned to the gateway.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthHandoffResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /v1/mail/pending:
+    get:
+      tags: [mail]
+      summary: Poll lightweight pending-mail metadata for HUD display.
+      description: >
+        Returns metadata only. PII-bearing body, analysis, replyDraft, Calendar
+        context, and approvalToken are fetched from GET /v1/mail/{mailId}/detail.
+        Claim expiry is enforced by every claim-dependent command, not by this
+        read endpoint. Personal mail is visible only to its owner; BU mail is
+        visible only to active members of the same normalized BU membership.
+      operationId: listPendingMailTickets
+      responses:
+        "200":
+          description: Lightweight pending-mail tickets.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TicketListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/mail/{mailId}/approve:
+    post:
+      tags: [mail]
+      summary: Approve and send a prepared Gmail draft.
+      description: >
+        Personal mail may be approved only by its owner. BU shared mail may be
+        approved only by the current claimant, who must still be an active
+        member of the same BU. The server checks resource authorization before
+        token/card-version validation and returns 404 to callers outside the
+        resource boundary. The approval transaction creates or resumes a
+        mail_send_operations row keyed by mailId/cardVersion. Gmail draft and
+        sent-message identifiers are persisted around each external call. A
+        retry first reconciles that operation and never sends a second message
+        merely because the previous HTTP response was lost.
+      operationId: approveMail
+      parameters:
+        - $ref: "#/components/parameters/MailId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApprovalRequest"
+      responses:
+        "200":
+          description: Gmail draft sent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MailSendResponse"
+        "202":
+          description: Send result is being reconciled; the client must poll/refetch rather than retry approval.
+          headers:
+            Retry-After:
+              description: Seconds before polling the mail-send operation resource.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MailSendResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/mail/{mailId}/reject:
+    post:
+      tags: [mail]
+      summary: Reject a prepared Gmail draft and request deletion.
+      description: >
+        Personal mail may be rejected only by its owner. BU shared mail may be
+        rejected only by the current claimant. The same resource and claim
+        authorization rules as approve apply before token validation.
+      operationId: rejectMail
+      parameters:
+        - $ref: "#/components/parameters/MailId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApprovalRequest"
+      responses:
+        "200":
+          description: Draft rejected.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RejectResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/mail/{mailId}/reissue-token:
+    post:
+      tags: [mail]
+      summary: Reissue an expired approvalToken for a pending mail card.
+      description: >
+        Called automatically by the HUD when token_expires_at has passed for a
+        pending mail card. Issues a new crypto.randomBytes(32) token, updates
+        token_expires_at to now+72h, increments card_version, and records
+        token_reissued in timeline_events. The plaintext token is returned only
+        in this response and must not be stored in event_inbox or logs.
+        Only the personal owner or current BU claimant may reissue a token.
+        Returns 404 outside that resource boundary and 409 if the card is
+        already approved or rejected.
+      operationId: reissueMailToken
+      security:
+        - googleIdToken: []
+      parameters:
+        - $ref: "#/components/parameters/MailId"
+      responses:
+        "200":
+          description: New approvalToken issued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReissueTokenResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/mail/tickets:
+    get:
+      tags: [mail]
+      summary: List mail tickets for the Jira-style HUD ticket board (v2).
+      description: >
+        Returns a lightweight ticket list for the authenticated user's BU.
+        Ticket status is derived from emails.status and the caller-relative claimState.
+        Four ticket sections rendered by the HUD: 未着手 (unclaimed), 自分が担当 (claimed by caller),
+        待機中 (pending_calendar), 他人対応中 (claimed by other BU member).
+        bodyPreview and replyDraft are excluded from this response.
+        Use GET /v1/mail/{mailId}/detail for full card content on demand (D-28).
+      operationId: listMailTickets
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Ticket list.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TicketListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/mail/{mailId}/claim:
+    post:
+      tags: [mail]
+      summary: Claim a BU shared mail for exclusive handling.
+      description: >
+        Atomically sets claimer_attendee_ref via conditional UPDATE WHERE claimer_attendee_ref IS NULL.
+        Returns 409 if already claimed by another BU member (Layer 1 exclusion).
+        The caller must be an active member of the mail's BU; non-members
+        receive 404. On success, the same transaction binds
+        approval_subject_hash to the claimant, issues the first plaintext
+        approvalToken, sets token_expires_at, increments card_version, and
+        broadcasts mail_claimed to all BU members by inserting
+        event_inbox_recipients rows for each BU member.
+        Before Gmail send, pg_try_advisory_lock(4, hashtext(mailId)) provides Layer 2 exclusion (D-26).
+        Every claim-dependent command evaluates the 2-hour expiry predicate;
+        expiry never depends on a prior list request. pending_calendar is
+        excluded from the 2-hour timeout because participant approval may take
+        longer, but becomes force-claimable by an active same-BU member after
+        24 hours.
+      operationId: claimMail
+      parameters:
+        - $ref: "#/components/parameters/MailId"
+      responses:
+        "200":
+          description: Claim acquired.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClaimResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    delete:
+      tags: [mail]
+      summary: Release the caller's own claim on a BU shared mail.
+      description: >
+        Resets claimer_attendee_ref and claimed_at to NULL.
+        Only the current claim holder may release; attempting to release
+        another member's claim returns 403.
+        It also invalidates approval_subject_hash and the current token. On
+        success, broadcasts mail_unclaimed to all BU members via event_inbox
+        (D-27). A new token is issued only after a later successful claim.
+      operationId: unclaimMail
+      parameters:
+        - $ref: "#/components/parameters/MailId"
+      responses:
+        "200":
+          description: Claim released.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success]
+                additionalProperties: false
+                properties:
+                  success:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/mail/{mailId}/transfer-targets:
+    get:
+      tags: [mail]
+      summary: List active same-BU members eligible to receive this mail claim.
+      operationId: listMailTransferTargets
+      parameters:
+        - $ref: "#/components/parameters/MailId"
+      responses:
+        "200":
+          description: Pseudonymous transfer targets within the mail resource boundary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransferTargetListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/mail/{mailId}/transfer:
+    post:
+      tags: [mail]
+      summary: Transfer a BU shared mail claim to another BU member.
+      description: >
+        Transfers claim ownership to another member of the same BU.
+        In a single transaction: updates claimer_attendee_ref to targetAttendeeRef,
+        binds and reissues approvalToken for the target claimant (invalidating
+        the previous token),
+        updates approval_subject_hash, and increments card_version.
+        Cross-BU transfer (targetAttendeeRef in a different BU) returns 400.
+        On success, broadcasts mail_transferred to all BU members via event_inbox (D-27).
+        Force-claim (D-49) - normally only the current claim holder may
+        transfer, but when the mail has been claimed for more than 24 hours
+        (including during pending_calendar, where the 2-hour lazy timeout is
+        suspended), any active member of the same BU may transfer the claim to
+        themselves. This resolves the absent-claim-holder deadlock. Earlier
+        attempts return 403. A force-claim records timeline_events:
+        mail_force_claimed and broadcasts to all BU members.
+      operationId: transferMail
+      parameters:
+        - $ref: "#/components/parameters/MailId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransferRequest"
+      responses:
+        "200":
+          description: Claim transferred.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransferResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/mail/{mailId}/detail:
+    get:
+      tags: [mail]
+      summary: Fetch the full mail approval card with PII fields on demand.
+      description: >
+        Returns the complete mail card including bodyPreview, replyDraft, and
+        the short-lived plaintext approvalToken. Called only when the user opens
+        a specific ticket in the HUD (D-28). Personal mail is visible only to
+        its owner. BU metadata is visible to active members of the same BU, but
+        bodyPreview, replyDraft, and approvalToken are returned only to the
+        current claimant; an unclaimed card has no approvalToken. Callers
+        outside the resource boundary receive 404.
+        bodyPreview and replyDraft must not be stored in event_inbox or logs.
+        Renderer IPC must not persist these values beyond the card display lifetime.
+      operationId: getMailDetail
+      parameters:
+        - $ref: "#/components/parameters/MailId"
+      responses:
+        "200":
+          description: Full mail approval card.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MailDetailResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/calendar/proposals/{proposalId}:
+    get:
+      tags: [calendar]
+      summary: Fetch a current calendar proposal card for HUD display.
+      description: >
+        Returns the current short-lived plaintext approvalToken only to an
+        authenticated Electron main/openclaw-client request when the caller has
+        a proposal_approvals row for an active approval proposal. For
+        manual_review_required proposals, approvalToken is omitted and HUD
+        displays manualConfirmation to the claim holder. Event inbox payloads
+        must not contain plaintext approvalToken because they are persisted in
+        Cloud SQL. The caller must own the associated personal mail or be the
+        participant/current claimant authorized by proposal_approvals within
+        the same BU. Other callers receive 404.
+      operationId: getCalendarProposal
+      parameters:
+        - $ref: "#/components/parameters/ProposalId"
+      responses:
+        "200":
+          description: Current calendar proposal card.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CalendarProposal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/calendar/proposals/{proposalId}/reissue-token:
+    post:
+      tags: [calendar]
+      summary: Reissue an expired approvalToken for an active calendar proposal.
+      description: >
+        Called automatically by the HUD when token_expires_at has passed for an
+        active calendar proposal. Issues a new crypto.randomBytes(32) token,
+        updates token_expires_at to now+72h, increments card_version, and records
+        token_reissued in timeline_events. If any slot's slotStart is in the past,
+        returns slotExpired: true so the HUD can prompt for re-planning instead.
+        Returns 409 if the proposal is already approved, rejected, or superseded.
+      operationId: reissueCalendarProposalToken
+      security:
+        - googleIdToken: []
+      parameters:
+        - $ref: "#/components/parameters/ProposalId"
+      responses:
+        "200":
+          description: New approvalToken issued, or slot expiry detected.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CalendarReissueTokenResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/calendar/proposals/{proposalId}/approve:
+    post:
+      tags: [calendar]
+      summary: Record this participant's approval for a calendar proposal.
+      description: >
+        Per-participant approval. OpenClaw verifies the approvalToken,
+        cardVersion, and google_subject_hash against the caller's row in
+        proposal_approvals (identified by attendee_ref derived from the
+        authenticated Google subject). Operating on another participant's row
+        returns 403. After updating this row, the Approval aggregator checks
+        all rows: if all participants are approved and every approved row has
+        the same selectedSlotId, aggregate_approval_status is set to all_approved
+        and a calendar operation is enqueued to Cloud Tasks (exactly once).
+        selection_conflict is detected eagerly (D-35): as soon as two approved
+        rows carry different selectedSlotIds the aggregate transitions to
+        selection_conflict without waiting for remaining participants, and no
+        Calendar write is performed. When unanimous, the transaction persists
+        an immutable encrypted execution plan (action, target calendar,
+        event resource/version, desired payload, selected slot, attendees) and
+        an outbox event. Dispatch to Cloud Tasks occurs from the outbox; task
+        creation is not part of the approval transaction. Returns 202 whether the aggregate is now
+        complete or still waiting for other participants. Stale cardVersion,
+        invalid token, unknown selectedSlotId, or tampered subject return 409
+        without side effects. Approving a superseded or cancelled proposal
+        returns 409 with code proposal_superseded and supersededByProposalId
+        so the HUD can switch to the current revision (D-35).
+      operationId: approveCalendarProposal
+      parameters:
+        - $ref: "#/components/parameters/ProposalId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CalendarApprovalRequest"
+      responses:
+        "202":
+          description: Calendar operation accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationAcceptedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/calendar/proposals/{proposalId}/reject-all:
+    post:
+      tags: [calendar]
+      summary: Record this participant's rejection for a calendar proposal.
+      description: >
+        Per-participant rejection. Updates the caller's row in proposal_approvals
+        to rejected with structured rejection inputs: reason code, optional
+        sanitized explanation, rejected slot ids, and preferred windows. Operating
+        on another participant's row returns 403. The first rejection immediately
+        sets aggregate_approval_status to any_rejected and triggers alternative
+        generation without waiting for all participants. The replanner uses the
+        rejection inputs, existing approvals from other participants, and current
+        Calendar availability; all participants re-vote on the new revision
+        (D-20). Approval rows are append-only (D-32): the new revision gets
+        freshly inserted proposal_approvals rows and the superseded rows are
+        kept as audit history, so the replanner can walk the parent chain and
+        avoid re-offering already-rejected slots. Rejecting a superseded or
+        cancelled proposal returns 409 with code proposal_superseded and
+        supersededByProposalId; near-simultaneous rejections from other
+        participants are re-entered on the new revision's card (D-35).
+      operationId: rejectCalendarProposal
+      parameters:
+        - $ref: "#/components/parameters/ProposalId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CalendarRejectionRequest"
+      responses:
+        "200":
+          description: Proposal rejected.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CalendarRejectResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/calendar/proposals/{proposalId}/cancel:
+    post:
+      tags: [calendar]
+      summary: Manually cancel a stalled calendar proposal (responsible user only).
+      description: >
+        Terminates a proposal that is stalled because some participants never
+        respond (OQ-MULTI-005 / D-34). Authorization follows the resource
+        authorizer (D-38/D-49) - for BU shared mail the current claim holder,
+        for a personal mailbox the mailbox owner (emails.owner_attendee_ref).
+        Other members receive 403; callers outside the resource boundary
+        receive 404. If the claim holder is absent, another BU member may
+        force-claim after 24 hours (see transfer) and then cancel. In one
+        transaction the proposal transitions to cancelled, all
+        proposal_approvals rows are invalidated, timeline_events records
+        cal_cancelled, and emails.status returns from pending_calendar to
+        pending_reply_approval - which also restores the 2-hour claim timeout.
+        The response includes gmailMessageId so the HUD can navigate the user
+        to Gmail for a manual reply (the schedule is still unconfirmed;
+        automatic reply-draft regeneration is v2). Approving, rejecting, or
+        reissuing tokens on a cancelled proposal returns 409 with code
+        proposal_superseded (supersededByProposalId is null for cancellation).
+      operationId: cancelCalendarProposal
+      parameters:
+        - $ref: "#/components/parameters/ProposalId"
+      responses:
+        "200":
+          description: Proposal cancelled; mail returned to reply-approval flow.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CalendarCancelResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/calendar/proposals/{proposalId}/alternatives:
+    post:
+      tags: [calendar]
+      summary: Generate an alternative calendar proposal after rejection or selection conflict.
+      description: >
+        Creates a new proposal revision from a rejected or selection-conflicted
+        proposal, the source mail, previous slots, structured rejection inputs,
+        existing participant approvals, and current Calendar availability. The
+        previous proposal is marked superseded. Returned slot context may include
+        event titles, sanitized event descriptions, and participant display names
+        for HUD review, but email addresses, Google event ids, calendar ids,
+        meeting URLs, and plaintext approvalToken must not be persisted in
+        event_inbox payloads or logs.
+      operationId: createCalendarProposalAlternative
+      parameters:
+        - $ref: "#/components/parameters/ProposalId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CalendarAlternativeRequest"
+      responses:
+        "201":
+          description: Alternative calendar proposal revision created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CalendarProposal"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/operations/{operationId}:
+    get:
+      tags: [calendar]
+      summary: Read asynchronous operation status.
+      description: >
+        Visible only to the personal owner who initiated the operation or an
+        active member of the operation's BU. Callers outside that resource
+        boundary receive 404. Results never expose attendee email addresses.
+      operationId: getOperation
+      parameters:
+        - $ref: "#/components/parameters/OperationId"
+      responses:
+        "200":
+          description: Operation status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/mail-send-operations/{operationId}:
+    get:
+      tags: [mail]
+      summary: Read Gmail send reconciliation status.
+      description: >
+        Returns the durable send status after approve returned 202. The caller
+        must be the personal owner or an active member of the mail's BU. A
+        caller outside that resource boundary receives 404. Clients must poll
+        this resource and must not retry the approve command while status is
+        sending, reconciling, or result_unknown.
+      operationId: getMailSendOperation
+      parameters:
+        - $ref: "#/components/parameters/OperationId"
+      responses:
+        "200":
+          description: Gmail send operation status.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MailSendOperationStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/faq-candidates/{faqCandidateId}:
+    get:
+      tags: [faq]
+      summary: Fetch an access-controlled FAQ candidate for review.
+      description: >
+        Returns encrypted-at-rest candidate text only to a caller authorized
+        for the source mail and FAQ review. Boundary failures return 404.
+        The response is Cache-Control: no-store and must not be logged.
+      operationId: getFaqCandidate
+      parameters:
+        - name: faqCandidateId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: FAQ candidate detail.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FaqCandidateDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/faqs:
+    post:
+      tags: [faq]
+      summary: Register an edited FAQ entry and update pgvector indexes.
+      operationId: createFaq
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateFaqRequest"
+      responses:
+        "201":
+          description: FAQ entry created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateFaqResponse"
+        "400":
+          description: Invalid FAQ payload, including missing or false piiReviewed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/settings:
+    get:
+      tags: [settings]
+      summary: Read current OpenClaw settings.
+      description: Backend/admin settings API. HUD MVP UI does not call this endpoint.
+      operationId: getSettings
+      x-openclaw-client: backend-admin
+      x-openclaw-hud: excluded
+      security:
+        - adminOidcToken: []
+      responses:
+        "200":
+          description: Current settings.
+          headers:
+            ETag:
+              description: Strong settings revision tag required by PUT If-Match.
+              schema:
+                type: string
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    put:
+      tags: [settings]
+      summary: Validate and update OpenClaw settings.
+      description: Backend/admin settings API. HUD MVP UI does not call this endpoint.
+      operationId: updateSettings
+      x-openclaw-client: backend-admin
+      x-openclaw-hud: excluded
+      security:
+        - adminOidcToken: []
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          description: ETag returned by the latest GET /v1/settings.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OpenClawSettingsUpdate"
+      responses:
+        "200":
+          description: Settings updated.
+          headers:
+            ETag:
+              description: Strong tag for the newly-created settings revision.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingsUpdateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/errors/{correlationId}/ack:
+    post:
+      tags: [errors]
+      summary: Acknowledge an error displayed by the HUD.
+      operationId: acknowledgeError
+      parameters:
+        - name: correlationId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Error acknowledged.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success]
+                additionalProperties: false
+                properties:
+                  success:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /internal/admin/users:
+    post:
+      tags: [internal]
+      summary: Pre-register a BU user. Invoked only by admin with IAP and Admin SA.
+      description: >
+        Admin-only endpoint for pre-registering BU members in the users table.
+        Accepts the Workspace email and normalized businessUnitRef, creates the
+        user and membership in one transaction, and generates attendeeRef.
+        The email is stored only as a hash until first-login subject binding.
+        Protected by Cloud IAP and requires Admin Service Account OIDC token.
+        Returns 409 if the pending user or active membership already exists.
+      operationId: createAdminUser
+      security:
+        - adminOidcToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminUserCreateRequest"
+      responses:
+        "201":
+          description: BU user pre-registered.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminUserCreateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /internal/admin/business-units:
+    post:
+      tags: [internal]
+      summary: Create a normalized business unit.
+      operationId: createBusinessUnit
+      security:
+        - adminOidcToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BusinessUnitCreateRequest"
+      responses:
+        "201":
+          description: Business unit created with an immutable reference.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BusinessUnit"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /internal/admin/business-units/{businessUnitRef}/disable:
+    post:
+      tags: [internal]
+      summary: Disable a business unit without deleting authorization history.
+      operationId: disableBusinessUnit
+      security:
+        - adminOidcToken: []
+      parameters:
+        - name: businessUnitRef
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Business unit disabled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [businessUnitRef, disabledAt]
+                additionalProperties: false
+                properties:
+                  businessUnitRef:
+                    type: string
+                    format: uuid
+                  disabledAt:
+                    type: string
+                    format: date-time
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /internal/outbox/{eventId}/replay:
+    post:
+      tags: [internal]
+      summary: Replay a dead-letter outbox event after operator review.
+      operationId: replayOutboxEvent
+      security:
+        - adminOidcToken: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Event returned to the pending dispatch queue.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, id, eventType, status]
+                additionalProperties: false
+                properties:
+                  success:
+                    type: boolean
+                  id:
+                    type: string
+                    format: uuid
+                  eventType:
+                    type: string
+                  status:
+                    type: string
+                    enum: [pending]
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /internal/outbox/dispatch:
+    post:
+      tags: [internal]
+      summary: Lease and dispatch transactional outbox events.
+      operationId: dispatchOutbox
+      security:
+        - schedulerOidcToken: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InternalBatchRequest"
+      responses:
+        "202":
+          description: Due events were leased and dispatch was attempted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalBatchAcceptedResponse"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+
+  /internal/mail-send/reconcile:
+    post:
+      tags: [internal]
+      summary: Lease Gmail send operations requiring provider reconciliation.
+      operationId: reconcileMailSendOperations
+      security:
+        - schedulerOidcToken: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InternalBatchRequest"
+      responses:
+        "202":
+          description: Reconciliation batch accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalBatchAcceptedResponse"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+
+  /internal/auth/compensate:
+    post:
+      tags: [internal]
+      summary: Expire abandoned OAuth sessions and enqueue provisioning recovery.
+      operationId: compensateOAuthProvisioning
+      security:
+        - schedulerOidcToken: []
+      responses:
+        "202":
+          description: OAuth compensation pass accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalBatchAcceptedResponse"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+
+  /internal/poll-gmail:
+    post:
+      tags: [internal]
+      summary: Run one Gmail polling cycle. Invoked only by Cloud Scheduler.
+      security:
+        - schedulerOidcToken: []
+      operationId: runGmailPollCycle
+      responses:
+        "202":
+          description: Polling cycle accepted or skipped because another worker holds the lock.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalJobAcceptedResponse"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+
+  /internal/gmail/notifications:
+    post:
+      tags: [internal]
+      summary: Receive an authenticated Gmail mailbox notification from Cloud Pub/Sub.
+      description: >
+        Decodes only the Gmail emailAddress and historyId envelope, resolves the
+        mailbox through the stored SHA-256 email hash, and runs an incremental
+        history sync. Unknown or malformed notifications are acknowledged as
+        ignored without disclosing mailbox enrollment.
+      operationId: receiveGmailNotification
+      security:
+        - pubsubOidcToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GmailPubsubPushRequest"
+      responses:
+        "202":
+          description: Notification acknowledged and processed or safely ignored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GmailNotificationAcceptedResponse"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+
+  /internal/gmail/watch/renew:
+    post:
+      tags: [internal]
+      summary: Renew Gmail mailbox watches that expire within one day.
+      operationId: renewGmailWatches
+      security:
+        - schedulerOidcToken: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InternalBatchRequest"
+      responses:
+        "202":
+          description: Due Gmail watches were renewed or marked for retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalBatchAcceptedResponse"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+
+  /internal/calendar/operations/{operationId}/execute:
+    post:
+      tags: [internal]
+      summary: Execute a persisted calendar operation. Invoked only by Cloud Tasks.
+      description: >
+        Loads the immutable encrypted plan, acquires the operation lock, and
+        revalidates free/busy data, slot freshness, proposal revision, target
+        event version/ETag, participant allowlist, and actor authorization
+        immediately before each write. A stale plan transitions to
+        replan_required without writing. Transient pre-write failures return a
+        retryable non-2xx status; terminal validation failures and persisted
+        participant results return 2xx. If a transport failure leaves an
+        external result uncertain, the worker reconciles by deterministic
+        operation marker before deciding whether to retry.
+      security:
+        - cloudTasksOidcToken: []
+      operationId: executeCalendarOperation
+      parameters:
+        - $ref: "#/components/parameters/OperationId"
+      responses:
+        "202":
+          description: Operation completed, skipped idempotently, requires re-planning, or has terminal results recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CalendarOperationExecutionResponse"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+
+  /internal/retention/pii-mask:
+    post:
+      tags: [internal]
+      summary: Run the daily retention job for PII masking and event cleanup. Invoked only by Cloud Scheduler.
+      security:
+        - schedulerOidcToken: []
+      operationId: runPiiRetentionMask
+      responses:
+        "202":
+          description: Retention job completed. It also enforces event_inbox hard TTL regardless of ACK state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetentionJobResponse"
+        "401":
+          $ref: "#/components/responses/InternalUnauthorized"
+        "403":
+          $ref: "#/components/responses/InternalForbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    googleIdToken:
+      type: http
+      scheme: bearer
+      bearerFormat: Google ID token
+      description: >
+        Google-signed ID token returned to the HUD after gateway/API
+        confidential OAuth exchange. Sent by the HUD to gateway-facing APIs in
+        Authorization, and also in Proxy-Authorization for the first IAP
+        programmatic-access approach. The private OpenClaw application validates
+        issuer, expiration, aud (the OAuth client ID), hosted domain, and
+        allowed subject. Cloud Run URL audience is used only for gateway,
+        Scheduler, and Tasks OIDC tokens.
+    gatewayOidcToken:
+      type: http
+      scheme: bearer
+      bearerFormat: Google OIDC token
+      description: >
+        OIDC identity token minted by the openclaw-hud-gateway service account
+        for private openclaw-api internal calls. The gateway service account
+        must have Cloud Run roles/run.invoker on openclaw-api. The private API
+        validates issuer, expiration, audience equal to the openclaw-api Cloud
+        Run service URL, and service account email allowlist.
+    bootstrapOidcToken:
+      type: http
+      scheme: bearer
+      bearerFormat: Google OIDC token
+      description: >
+        OIDC identity token minted by the auth-bootstrap service account. The
+        private API accepts it only on the internal handoff redeem endpoint.
+    adminOidcToken:
+      type: http
+      scheme: bearer
+      bearerFormat: Google OIDC token
+      description: >
+        OIDC identity token minted by the dedicated admin service account.
+        The private API validates issuer, expiration, audience equal to the
+        openclaw-api Cloud Run service URL, and exact Admin SA email allowlist.
+        Gateway, Scheduler, Tasks, runtime, and end-user tokens are rejected.
+    schedulerOidcToken:
+      type: http
+      scheme: bearer
+      bearerFormat: Google OIDC token
+      description: >
+        OIDC identity token issued to the Cloud Scheduler service account.
+        The Scheduler service account must have Cloud Run roles/run.invoker.
+        OpenClaw also validates issuer, expiration, audience, and service
+        account email allowlist in application code. In MVP, audience must
+        match the Cloud Run service URL.
+    cloudTasksOidcToken:
+      type: http
+      scheme: bearer
+      bearerFormat: Google OIDC token
+      description: >
+        OIDC identity token issued to the Cloud Tasks service account. The
+        Tasks service account must have Cloud Run roles/run.invoker. OpenClaw
+        also validates issuer, expiration, audience, and service account email
+        allowlist in application code. In MVP, audience must match the Cloud
+        Run service URL.
+    pubsubOidcToken:
+      type: http
+      scheme: bearer
+      bearerFormat: Google OIDC token
+      description: >
+        OIDC identity token issued to the dedicated Pub/Sub push service
+        account. The API validates the Cloud Run audience and exact service
+        account email before accepting Gmail mailbox notifications.
+  headers:
+    NoStore:
+      description: Sensitive or pseudonymous response must not be cached.
+      schema:
+        type: string
+        const: no-store
+  parameters:
+    MailId:
+      name: mailId
+      in: path
+      required: true
+      schema:
+        type: string
+    ProposalId:
+      name: proposalId
+      in: path
+      required: true
+      schema:
+        type: string
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      schema:
+        type: string
+    OperationId:
+      name: operationId
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, timestamp, revision, db, heartbeat, bootstrap]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        timestamp:
+          type: string
+          format: date-time
+        revision:
+          type: string
+          description: Cloud Run revision name serving this response.
+        db:
+          type: object
+          required: [status, latencyMs]
+          additionalProperties: false
+          properties:
+            status:
+              type: string
+              enum: [ok]
+            latencyMs:
+              type: integer
+              minimum: 0
+              description: Cloud SQL reachability check latency in milliseconds.
+        heartbeat:
+          type: object
+          required: [status, checkedAt]
+          additionalProperties: false
+          properties:
+            status:
+              type: string
+              enum: [ok]
+            checkedAt:
+              type: string
+              format: date-time
+        bootstrap:
+          type: object
+          required: [required, reason]
+          additionalProperties: false
+          properties:
+            required:
+              type: boolean
+              description: True when the backend refresh token state is missing or invalid and the HUD must start a new gateway OAuth browser flow. The HUD never calls /v1/auth/bootstrap and never sends refresh tokens.
+            reason:
+              type: [string, "null"]
+              enum: [missing, invalid, null]
+              description: Missing or invalid backend refresh token state. null when bootstrap is not required.
+    ProbeResponse:
+      type: object
+      required: [status, timestamp]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        timestamp:
+          type: string
+          format: date-time
+    ApprovalRequest:
+      type: object
+      required: [approvalToken, cardVersion]
+      additionalProperties: false
+      properties:
+        approvalToken:
+          type: string
+          description: Short-lived opaque token generated by OpenClaw.
+        cardVersion:
+          type: integer
+          minimum: 1
+    SanitizedAuthClaims:
+      type: object
+      additionalProperties: false
+      properties:
+        sub:
+          type: string
+        email:
+          type: string
+          format: email
+        hd:
+          type: string
+        aud:
+          type: string
+        exp:
+          type: integer
+    BootstrapState:
+      type: object
+      required: [completed, bindingHash, reason]
+      additionalProperties: false
+      properties:
+        completed:
+          type: boolean
+          description: True when backend confidential exchange has stored the Gmail refresh token in Secret Manager for this subject.
+        bindingHash:
+          type: [string, "null"]
+          description: SHA-256 over gateway URL, organization domain, OAuth client ID, and Google subject. Non-secret local metadata for the HUD.
+        reason:
+          type: [string, "null"]
+          enum: [missing, invalid, completed, null]
+    AuthHandoffResponse:
+      type: object
+      required: [idToken, expiresAt, claims, bootstrap]
+      additionalProperties: false
+      properties:
+        idToken:
+          type: string
+          description: Short-lived Google ID token. Never log and never expose to renderer IPC payloads.
+        expiresAt:
+          type: string
+          format: date-time
+        claims:
+          $ref: "#/components/schemas/SanitizedAuthClaims"
+        bootstrap:
+          $ref: "#/components/schemas/BootstrapState"
+    AuthExchangeResponse:
+      type: object
+      required: [handoffCode, expiresAt, returnUri]
+      additionalProperties: false
+      properties:
+        handoffCode:
+          type: string
+          minLength: 43
+          description: Random single-use code. It contains no token or claims and expires after 60 seconds.
+        expiresAt:
+          type: string
+          format: date-time
+        returnUri:
+          type: string
+          format: uri
+    HandoffRedeemRequest:
+      type: object
+      required: [handoffCode, handoffVerifier]
+      additionalProperties: false
+      properties:
+        handoffCode:
+          type: string
+          minLength: 43
+        handoffVerifier:
+          type: string
+          minLength: 43
+          maxLength: 128
+          pattern: '^[A-Za-z0-9._~-]+$'
+    IdTokenRefreshResponse:
+      type: object
+      required: [idToken, expiresAt, claims]
+      additionalProperties: false
+      properties:
+        idToken:
+          type: string
+          description: New short-lived Google ID token. Response must not include refresh_token or access_token.
+        expiresAt:
+          type: string
+          format: date-time
+        claims:
+          $ref: "#/components/schemas/SanitizedAuthClaims"
+    OAuthSessionCreateRequest:
+      type: object
+      required: [returnUri, handoffChallenge]
+      additionalProperties: false
+      properties:
+        returnUri:
+          type: string
+          format: uri
+          pattern: '^http://(127\.0\.0\.1|\[::1\]):(102[4-9]|10[3-9][0-9]|1[1-9][0-9]{2}|[2-9][0-9]{3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])/callback$'
+          description: HUD loopback URI supplied to gateway /v1/auth/start.
+        handoffChallenge:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{43}$'
+          description: S256 challenge for a verifier that remains only in the HUD main process.
+    OAuthSessionCreateResponse:
+      type: object
+      required: [authorizationUrl, state, expiresAt]
+      additionalProperties: false
+      properties:
+        authorizationUrl:
+          type: string
+          format: uri
+        state:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+    OAuthExchangeRequest:
+      type: object
+      required: [code, state]
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+        state:
+          type: string
+    CalendarApprovalRequest:
+      type: object
+      description: >
+        Calendar approval body. OpenClaw must verify approvalToken, cardVersion,
+        approver subject, token expiry, and that selectedSlotId exists in the
+        current calendar_proposals.slots candidates for this proposal revision.
+        OpenClaw derives slotStart/slotEnd from the persisted slot rather than
+        trusting client-supplied timestamps. Stale, non-member, unknown-slot, or
+        tampered requests return 409 and must not create an operation or call
+        Google Calendar.
+      required: [approvalToken, cardVersion, selectedSlotId]
+      additionalProperties: false
+      properties:
+        approvalToken:
+          type: string
+          description: Short-lived opaque token generated by OpenClaw.
+        cardVersion:
+          type: integer
+          minimum: 1
+        selectedSlotId:
+          type: string
+          minLength: 1
+          maxLength: 80
+          description: Stable id of the slot selected from this proposal revision.
+    CalendarRejectionRequest:
+      type: object
+      description: >
+        Calendar rejection body. The reason code, rejected slots, preferred
+        windows, and sanitized explanation are stored on the caller's
+        proposal_approvals row and used by the immediate replanner. Free-form
+        explanation is allowed only after the backend masks email addresses,
+        meeting URLs, access tokens, and external identifiers. event_inbox and
+        timeline_events store only non-PII summary codes.
+      required: [approvalToken, cardVersion, rejectionReasonCode]
+      additionalProperties: false
+      properties:
+        approvalToken:
+          type: string
+        cardVersion:
+          type: integer
+          minimum: 1
+        rejectionReasonCode:
+          type: string
+          enum:
+            - no_common_slot
+            - poor_context
+            - outside_requested_period
+            - needs_more_options
+            - missing_participant
+            - manual_review_requested
+            - other_non_pii
+        rejectionReasonDetail:
+          type: [string, "null"]
+          maxLength: 500
+          description: Sanitized short explanation from the HUD rejection form.
+        rejectedSlotIds:
+          type: array
+          maxItems: 3
+          description: Slot ids that should be avoided in the next revision.
+          items:
+            type: string
+            minLength: 1
+            maxLength: 80
+        preferredWindows:
+          type: array
+          maxItems: 3
+          description: Optional windows the rejecting participant says would work better.
+          items:
+            $ref: "#/components/schemas/CalendarPreferredWindowInput"
+    CalendarPreferredWindowInput:
+      type: object
+      required: [start, end]
+      additionalProperties: false
+      properties:
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+    CalendarAlternativeRequest:
+      type: object
+      description: >
+        Request to create a new proposal revision from a rejected or
+        selection-conflicted proposal. In the normal rejection flow this is
+        triggered immediately by the first rejection.
+        The backend recovers structured rejection inputs, existing participant
+        approvals, and Calendar availability from Cloud SQL instead of relying
+        on an LLM chat session. HUD use is reserved for retry/manual recovery.
+      required: [replanReasonCode]
+      additionalProperties: false
+      properties:
+        replanReasonCode:
+          type: string
+          enum:
+            - expand_period
+            - reduce_attendees
+            - avoid_high_priority_neighbors
+            - prefer_earlier
+            - prefer_later
+            - selection_conflict
+            - manual_review_requested
+            - other_non_pii
+        requestedWindowStart:
+          type: [string, "null"]
+          format: date-time
+        requestedWindowEnd:
+          type: [string, "null"]
+          format: date-time
+        constraintReasonCodes:
+          type: array
+          items:
+            type: string
+            enum:
+              - avoid_before_high_priority
+              - avoid_after_high_priority
+              - require_all_attendees_free
+              - keep_within_requested_period
+              - allow_period_expansion
+    ReissueTokenResponse:
+      type: object
+      required: [approvalToken, cardVersion, tokenExpiresAt]
+      additionalProperties: false
+      properties:
+        approvalToken:
+          type: string
+          description: >
+            New short-lived plaintext approvalToken. Must not be stored in
+            event_inbox or logs. Valid for 72 hours from issuance.
+        cardVersion:
+          type: integer
+          description: Incremented card version. HUD must use this version for subsequent approve/reject calls.
+        tokenExpiresAt:
+          type: string
+          format: date-time
+          description: New expiry time (now + 72h).
+    CalendarReissueTokenResponse:
+      type: object
+      required: [cardVersion, tokenExpiresAt, slotExpired]
+      additionalProperties: false
+      properties:
+        approvalToken:
+          type: string
+          description: >
+            New short-lived plaintext approvalToken. Only present when slotExpired is false.
+            Must not be stored in event_inbox or logs.
+        cardVersion:
+          type: integer
+          description: Incremented card version.
+        tokenExpiresAt:
+          type: string
+          format: date-time
+          description: >
+            New expiry time when slotExpired is false. When slotExpired is true,
+            this is the current row expiry and HUD must request re-planning
+            instead of approving.
+        slotExpired:
+          type: boolean
+          description: >
+            True when one or more candidate slots have a slotStart in the past.
+            When true, HUD must prompt the user to request re-planning instead of
+            approving. approvalToken is not returned.
+        candidateLimitReason:
+          type: string
+          description: >
+            Present only when slotExpired is true. Value: SLOT_EXPIRED.
+            HUD displays a re-plan prompt referencing this reason.
+    MailApprovalCard:
+      type: object
+      required:
+        - mailId
+        - cardVersion
+        - cardType
+        - canApprove
+        - claimRequired
+        - analysisStatus
+        - subject
+        - senderDisplayName
+        - urgency
+        - category
+        - summary
+        - intent
+        - actions
+      additionalProperties: false
+      properties:
+        mailId:
+          type: string
+        approvalToken:
+          type: [string, "null"]
+          description: >
+            Present only for an approval_ready card returned to the personal
+            owner or current BU claimant. Never present before a shared-mail
+            claim is acquired.
+        cardVersion:
+          type: integer
+        tokenExpiresAt:
+          type: [string, "null"]
+          format: date-time
+        cardType:
+          type: string
+          enum: [approval_ready, manual_action_required, bounce_notice]
+        canApprove:
+          type: boolean
+          description: True only when the caller is authorized and a usable draft/token exists.
+        claimRequired:
+          type: boolean
+          description: True for an unclaimed BU shared mail card.
+        analysisStatus:
+          type: string
+          enum: [succeeded, failed, skipped_bounce]
+        failureReasonCode:
+          type: [string, "null"]
+          enum: [null, model_unavailable, invalid_model_output, unsafe_content, draft_generation_failed]
+          description: Stable non-sensitive reason code when analysisStatus is failed.
+        subject:
+          type: string
+        senderDisplayName:
+          type: string
+        urgency:
+          type: string
+          enum: [high, medium, low, none]
+        category:
+          type: string
+        bodyPreview:
+          type: [string, "null"]
+          description: >
+            [PII] First 500 characters of the email body. Displayed in HUD so
+            the user can read enough context to decide whether to approve the
+            draft reply. Must not be stored in event_inbox payloads or logs.
+            Renderer IPC must not persist this value beyond the card display
+            lifetime. Null for a BU member who is not the current claimant.
+        summary:
+          type: string
+        intent:
+          type: string
+        actions:
+          type: array
+          description: Extracted tasks / required actions from the email.
+          items:
+            type: string
+        replyDraft:
+          type: [string, "null"]
+          description: >
+            Full text of the AI-generated reply draft. Displayed in HUD for
+            review before the user approves or rejects. Must not be stored in
+            event_inbox payloads or logs. On approval this draft is sent as-is
+            via Gmail compose. Renamed from replyPreview to reflect that the
+            full draft content (not just a preview) is returned.
+            Null for manual_action_required and bounce_notice cards, and for
+            BU members who are not the current claimant.
+        calendarProposals:
+          type: array
+          description: >
+            このメールに紐付くカレンダー調整案の一覧。スケジュール関連メールの場合のみ存在する。
+            This token-bearing shape is returned only to the authenticated
+            Electron main/openclaw-client card fetch response. Renderer IPC must
+            strip approvalToken and pass only a CalendarProposalView-equivalent
+            safe payload. MVP では calendarProposals[].conflictInfo は常に null として返す（RC-CAL-002）。
+          items:
+            $ref: "#/components/schemas/CalendarProposal"
+        claimerAttendeeRef:
+          type: [string, "null"]
+          description: >
+            attendee_ref of the BU member currently holding the claim on this mail.
+            null if unclaimed or if the mail is from a personal mailbox.
+        claimedAt:
+          type: [string, "null"]
+          format: date-time
+          description: >
+            Timestamp when the current claim was acquired. null if unclaimed.
+            Claims auto-expire after 2 hours only outside pending_calendar.
+    CalendarSlot:
+      type: object
+      required: [slotId, slotStart, slotEnd, participantContexts, isWithinRequestedPeriod]
+      additionalProperties: false
+      properties:
+        slotId:
+          type: string
+          minLength: 1
+          maxLength: 80
+          description: Stable id within this proposal revision. Used for per-participant selection aggregation.
+        slotStart:
+          type: string
+          format: date-time
+        slotEnd:
+          type: string
+          format: date-time
+        rank:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 3
+          description: Rank after deterministic scheduling score. Null only for legacy cards.
+        scoreReasonCodes:
+          type: array
+          description: Non-PII reason codes used to explain candidate priority.
+          items:
+            type: string
+            enum:
+              - all_attendees_free
+              - before_window_busy
+              - after_window_busy
+              - adjacent_high_priority
+              - long_meeting_nearby
+              - within_requested_period
+              - outside_requested_period
+              - manual_check_required
+        beforeWindow:
+          $ref: "#/components/schemas/CalendarAdjacentWindowSummary"
+        afterWindow:
+          $ref: "#/components/schemas/CalendarAdjacentWindowSummary"
+        manualCheckRequired:
+          type: boolean
+          default: false
+        candidateLimitReason:
+          type: [string, "null"]
+          enum:
+            - no_common_free_slot
+            - fewer_than_three_common_slots
+            - availability_unreadable
+            - requested_period_too_narrow
+            - manual_review_required
+            - BUSINESS_UNITS_NOT_CONFIGURED
+            - selection_conflict
+            - external_manual_confirmation_required
+            - max_revisions_reached
+            - null
+        previousEventTitle:
+          type: [string, "null"]
+          deprecated: true
+          description: Deprecated aggregate field. Use participantContexts[].beforeEvents[].title.
+        previousEventEnd:
+          type: [string, "null"]
+          format: date-time
+          deprecated: true
+          description: Deprecated aggregate field. Use participantContexts[].beforeEvents[].endTime.
+        nextEventTitle:
+          type: [string, "null"]
+          deprecated: true
+          description: Deprecated aggregate field. Use participantContexts[].afterEvents[].title.
+        nextEventStart:
+          type: [string, "null"]
+          format: date-time
+          deprecated: true
+          description: Deprecated aggregate field. Use participantContexts[].afterEvents[].startTime.
+        periodLabel:
+          type: [string, "null"]
+          enum: [within_requested_period, outside_requested_period, null]
+          description: Explicitly marks whether this option is outside the requested period.
+        isWithinRequestedPeriod:
+          type: boolean
+        participantContexts:
+          type: array
+          description: >
+            Per-candidate before/after schedule context for all participants in
+            this proposal. HUD may display event titles, sanitized descriptions,
+            and participant display names so every participant can evaluate the
+            impact of each candidate. Email addresses, meeting URLs, Google
+            event ids, calendar ids, and access tokens must be redacted.
+          items:
+            $ref: "#/components/schemas/CalendarParticipantContext"
+    CalendarAdjacentWindowSummary:
+      type: object
+      description: >
+        Aggregate one-hour context before or after a candidate slot. Detailed
+        display context is returned in participantContexts; this object remains
+        useful for ranking and compact HUD summaries.
+      required: [windowOffset, busyBlockCount, highPriorityBlockCount, priorityImpact, reasonCodes]
+      additionalProperties: false
+      properties:
+        windowOffset:
+          type: string
+          enum: [before, after]
+        busyBlockCount:
+          type: integer
+          minimum: 0
+        highPriorityBlockCount:
+          type: integer
+          minimum: 0
+        priorityImpact:
+          type: string
+          enum: [none, low, medium, high]
+        reasonCodes:
+          type: array
+          items:
+            type: string
+            enum:
+              - no_adjacent_busy
+              - adjacent_busy
+              - adjacent_high_priority
+              - long_meeting_nearby
+              - unreadable_availability
+              - manual_check_required
+    CalendarParticipantContext:
+      type: object
+      required: [participantRef, displayName, beforeEvents, afterEvents]
+      additionalProperties: false
+      description: >
+        Schedule context for one participant around one candidate slot. Display
+        names, event titles, and sanitized event descriptions may be shown in
+        the HUD. Email addresses and external identifiers must be redacted.
+      properties:
+        participantRef:
+          type: string
+          description: Pseudonymous attendee_ref used as a stable key. Not an email address.
+        displayName:
+          type: string
+          description: Participant display name or business role label.
+        beforeEvents:
+          type: array
+          description: Events ending within the configured context window before the candidate slot.
+          items:
+            $ref: "#/components/schemas/CalendarAdjacentEventDisplay"
+        afterEvents:
+          type: array
+          description: Events starting within the configured context window after the candidate slot.
+          items:
+            $ref: "#/components/schemas/CalendarAdjacentEventDisplay"
+    CalendarAdjacentEventDisplay:
+      type: object
+      required: [title, startTime, endTime, participantNames]
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          maxLength: 200
+          description: Sanitized calendar event title.
+        description:
+          type: [string, "null"]
+          maxLength: 2000
+          description: Sanitized calendar event body/description. Email addresses and meeting URLs are redacted.
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+        participantNames:
+          type: array
+          description: Display names only. Email addresses must not be returned.
+          items:
+            type: string
+        priorityImpact:
+          type: string
+          enum: [none, low, medium, high]
+    CalendarProposal:
+      type: object
+      description: >
+        Calendar proposal returned only to authenticated Electron
+        main/openclaw-client card fetch responses. Active approval proposals
+        may include a plaintext approvalToken for the caller; manual review
+        proposals omit approvalToken and include manualConfirmation. This is a
+        main-process cache object, not a renderer IPC payload. Renderer IPC must
+        remove approvalToken before display.
+      required: [proposalId, cardVersion, slots, status]
+      additionalProperties: false
+      properties:
+        proposalId:
+          type: string
+        parentProposalId:
+          type: [string, "null"]
+          description: Previous proposal id when this proposal is an alternative revision.
+        revision:
+          type: integer
+          minimum: 1
+          default: 1
+        approvalToken:
+          type: string
+          description: >
+            Short-lived plaintext token returned only when the caller has a
+            proposal_approvals row for an active approval proposal. Not returned
+            for manual_review_required proposals.
+        cardVersion:
+          type: integer
+        tokenExpiresAt:
+          type: [string, "null"]
+          format: date-time
+          description: Token expiry for approvalToken; null when no token is returned.
+        status:
+          type: string
+          enum: [active, manual_review_required, execution_pending, executed, executed_with_failures, superseded, cancelled]
+          description: >
+            manual_review_required means automatic Calendar writing is stopped
+            (required unmanaged participants, zero candidate slots,
+            revision >= 3 / max_revisions_reached, or a fully failed write);
+            HUD should show manualConfirmation to the responsible user instead
+            of approval controls. execution_pending covers committed
+            operation/outbox through worker completion; executed is set only
+            after all attendee writes succeeded. executed_with_failures means
+            partial failures were recorded and the responsible user (BU claim
+            holder or personal mailbox owner) sees a manual-correction card
+            (D-48). A stale pre-write revalidation (replan_required) supersedes
+            the proposal and auto-creates a new revision. cancelled means the
+            responsible user manually terminated a stalled proposal via the
+            cancel endpoint (D-34/D-49).
+        slots:
+          type: array
+          minItems: 0
+          maxItems: 3
+          items:
+            $ref: "#/components/schemas/CalendarSlot"
+        candidateCount:
+          type: integer
+          minimum: 0
+          maximum: 3
+          description: Number of slots generated for this proposal.
+        candidateLimitReason:
+          type: [string, "null"]
+          enum:
+            - no_common_free_slot
+            - fewer_than_three_common_slots
+            - availability_unreadable
+            - requested_period_too_narrow
+            - manual_review_required
+            - BUSINESS_UNITS_NOT_CONFIGURED
+            - selection_conflict
+            - external_manual_confirmation_required
+            - max_revisions_reached
+            - null
+        alternativeSuggestions:
+          type: array
+          description: Non-PII alternatives when fewer than three candidates can be generated.
+          items:
+            type: string
+            enum:
+              - expand_requested_period
+              - reduce_required_attendees
+              - ask_participants_manually
+              - request_new_constraints
+              - use_outside_requested_period
+              - manual_external_confirmation
+              - manual_review_required
+        unavailableAttendees:
+          type: array
+          description: >
+            Calendar availability could not be read for one or more attendees.
+            MVP returns only non-PII reason code strings; counts are derived
+            from array length. Attendee emails, display names, and event
+            identifiers must not be returned.
+          items:
+            type: string
+        manualConfirmation:
+          description: >
+            Present when one or more required participants are unmanaged
+            external/not-onboarded participants and automatic Calendar writing
+            is stopped. HUD displays copyText to the claim holder for manual
+            confirmation outside OpenClaw.
+          oneOf:
+            - $ref: "#/components/schemas/ManualConfirmationPrompt"
+            - type: "null"
+        conflictInfo:
+          description: >
+            Detailed conflict object remains null. Candidate review context is
+            returned through slots[].participantContexts instead. Email
+            addresses, Google event ids, calendar ids, meeting URLs, and tokens
+            must not be returned.
+          type: "null"
+    ManualConfirmationPrompt:
+      type: object
+      required: [reasonCode, copyText, participantLabels]
+      additionalProperties: false
+      properties:
+        reasonCode:
+          type: string
+          enum:
+            - external_manual_confirmation_required
+            - not_onboarded_manual_confirmation_required
+        participantLabels:
+          type: array
+          description: Display labels only; email addresses must not be returned.
+          items:
+            type: string
+        copyText:
+          type: string
+          maxLength: 4000
+          description: >
+            Text the claim holder can copy into email/chat to confirm candidate
+            slots manually. Must not include email addresses, tokens, Google
+            event ids, calendar ids, or meeting URLs.
+        resumeInstruction:
+          type: [string, "null"]
+          description: Short HUD-facing instruction for how the claim holder resumes manual handling.
+    ConflictDetail:
+      description: >
+        Reserved for a future Legal/UX-approved API version. MVP CalendarProposal
+        uses conflictInfo: null, so this schema must not be returned by HUD/API.
+      type: object
+      required: [participantEmail, existingEventTitle, existingEventStart, existingEventEnd]
+      additionalProperties: false
+      properties:
+        participantEmail:
+          type: string
+          format: email
+          description: Attendee email address for the conflict. PII-sensitive.
+        existingEventTitle:
+          type: string
+          description: Existing conflicting event title. PII-sensitive.
+          maxLength: 200
+        existingEventStart:
+          type: string
+          format: date-time
+          description: Existing conflicting event start time in ISO 8601 UTC.
+        existingEventEnd:
+          type: string
+          format: date-time
+          description: Existing conflicting event end time in ISO 8601 UTC.
+    Event:
+      type: object
+      required: [eventId, type, createdAt, payload]
+      additionalProperties: false
+      properties:
+        eventId:
+          type: string
+        type:
+          type: string
+          enum:
+            - mail_approval_ready
+            - mail_manual_action_required
+            - mail_bounced
+            - mail_reply_ready
+            - mail_claimed
+            - mail_unclaimed
+            - mail_transferred
+            - calendar_proposals_ready
+            - calendar_alternatives_ready
+            - faq_candidate
+            - calendar_operation_succeeded
+            - calendar_operation_failed
+            - critical_error
+            - status_changed
+        createdAt:
+          type: string
+          format: date-time
+        mailId:
+          type: [string, "null"]
+        operationId:
+          type: [string, "null"]
+        payload:
+          description: >
+            Payload must match Event.type. Implementations must reject mismatched
+            pairs such as type=critical_error with a mail approval payload.
+          oneOf:
+            - $ref: "#/components/schemas/MailApprovalReadyPayload"
+            - $ref: "#/components/schemas/MailLifecyclePayload"
+            - $ref: "#/components/schemas/CalendarProposalsReadyPayload"
+            - $ref: "#/components/schemas/FaqCandidatePayload"
+            - $ref: "#/components/schemas/CalendarOperationSucceededPayload"
+            - $ref: "#/components/schemas/CalendarOperationFailedPayload"
+            - $ref: "#/components/schemas/CriticalErrorPayload"
+            - $ref: "#/components/schemas/StatusChangedPayload"
+            - $ref: "#/components/schemas/ClaimEventPayload"
+      oneOf:
+        - required: [type, payload]
+          properties:
+            type:
+              const: mail_approval_ready
+            payload:
+              $ref: "#/components/schemas/MailApprovalReadyPayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: mail_manual_action_required
+            payload:
+              $ref: "#/components/schemas/MailLifecyclePayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: mail_bounced
+            payload:
+              $ref: "#/components/schemas/MailLifecyclePayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: calendar_proposals_ready
+            payload:
+              $ref: "#/components/schemas/CalendarProposalsReadyPayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: calendar_alternatives_ready
+            payload:
+              $ref: "#/components/schemas/CalendarProposalsReadyPayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: faq_candidate
+            payload:
+              $ref: "#/components/schemas/FaqCandidatePayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: calendar_operation_succeeded
+            payload:
+              $ref: "#/components/schemas/CalendarOperationSucceededPayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: calendar_operation_failed
+            payload:
+              $ref: "#/components/schemas/CalendarOperationFailedPayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: critical_error
+            payload:
+              $ref: "#/components/schemas/CriticalErrorPayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: status_changed
+            payload:
+              $ref: "#/components/schemas/StatusChangedPayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: mail_reply_ready
+            payload:
+              $ref: "#/components/schemas/MailApprovalReadyPayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: mail_claimed
+            payload:
+              $ref: "#/components/schemas/ClaimEventPayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: mail_unclaimed
+            payload:
+              $ref: "#/components/schemas/ClaimEventPayload"
+        - required: [type, payload]
+          properties:
+            type:
+              const: mail_transferred
+            payload:
+              $ref: "#/components/schemas/ClaimEventPayload"
+    MailApprovalReadyPayload:
+      type: object
+      description: >
+        Event inbox notification only. It must not contain plaintext
+        approvalToken because event_inbox.payload is persisted in Cloud SQL.
+        HUD must fetch the current card through authenticated mail endpoints
+        to receive a short-lived plaintext approvalToken.
+      required: [mailId, cardVersion]
+      additionalProperties: false
+      properties:
+        mailId:
+          type: string
+        cardVersion:
+          type: integer
+        tokenExpiresAt:
+          type: [string, "null"]
+          format: date-time
+          description: Null for shared mail until a claimant receives the first token.
+    MailLifecyclePayload:
+      type: object
+      description: >
+        Metadata-only event. Detailed failure text, subject, body, draft, and
+        recipient data are excluded from the persisted event inbox.
+      required: [mailId, cardVersion, reasonCode]
+      additionalProperties: false
+      properties:
+        mailId:
+          type: string
+        cardVersion:
+          type: integer
+        reasonCode:
+          type: string
+          enum: [analysis_failed, unsafe_content, draft_missing, delivery_failed, delivery_delayed]
+    CalendarProposalsReadyPayload:
+      type: object
+      description: >
+        Event inbox notification only. It must not contain plaintext
+        approvalToken because event_inbox.payload is persisted in Cloud SQL.
+        It also must not contain proposal card content such as slots,
+        candidate details, unavailable attendee summaries, or alternatives.
+        HUD must fetch the current proposal card through authenticated mail or
+        calendar endpoints to receive a short-lived plaintext approvalToken.
+      required: [mailId, proposalId, cardVersion, tokenExpiresAt]
+      additionalProperties: false
+      properties:
+        mailId:
+          type: string
+        proposalId:
+          type: string
+        parentProposalId:
+          type: [string, "null"]
+        cardVersion:
+          type: integer
+        tokenExpiresAt:
+          type: string
+          format: date-time
+    FaqCandidatePayload:
+      type: object
+      description: >
+        Metadata-only notification. Candidate question/answer text remains in
+        the access-controlled FAQ candidate store and is fetched on demand.
+      required: [faqCandidateId, sourceMailId]
+      additionalProperties: false
+      properties:
+        faqCandidateId:
+          type: string
+        sourceMailId:
+          type: string
+    CalendarOperationSucceededPayload:
+      type: object
+      required: [operationId, succeededAttendees]
+      additionalProperties: false
+      properties:
+        operationId:
+          type: string
+        succeededAttendees:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttendeeOperationResult"
+    CalendarOperationFailedPayload:
+      type: object
+      required: [operationId, succeededAttendees, failedAttendees, correlationId, manualRemediationRequired]
+      additionalProperties: false
+      properties:
+        operationId:
+          type: string
+        succeededAttendees:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttendeeOperationResult"
+        failedAttendees:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttendeeOperationResult"
+        correlationId:
+          type: string
+        manualRemediationRequired:
+          type: boolean
+          const: true
+    AttendeeOperationResult:
+      description: >
+        Participant-level Calendar write result. MVP responses must not expose
+        attendee email or displayName; manual remediation is signaled by status,
+        errorCode, operationId, correlationId, and manualRemediationRequired.
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        email:
+          type: "null"
+          description: Reserved for future Legal/UX-approved exposure; MVP must omit or return null.
+        displayName:
+          type: "null"
+        status:
+          type: string
+          enum: [succeeded, failed, skipped]
+        errorCode:
+          type: [string, "null"]
+    CriticalErrorPayload:
+      type: object
+      required: [errorType, correlationId, occurredAt, detail]
+      additionalProperties: false
+      properties:
+        errorType:
+          type: string
+        correlationId:
+          type: string
+        occurredAt:
+          type: string
+          format: date-time
+        detail:
+          type: string
+          maxLength: 200
+          description: Safe user-facing message only. Raw exception text, HTTP headers, request/response bodies, tokens, API keys, secret resource names, and PII are prohibited.
+        mailId:
+          type: [string, "null"]
+    StatusChangedPayload:
+      type: object
+      required: [mailId, status]
+      additionalProperties: false
+      properties:
+        mailId:
+          type: string
+        status:
+          type: string
+          enum: [unhandled, in_progress, answered, resolved, pending, pending_calendar, pending_reply_approval, draft_missing]
+    MailSendResponse:
+      type: object
+      required: [success, mailId, operationId, status]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        mailId:
+          type: string
+        operationId:
+          type: string
+        status:
+          type: string
+          enum: [succeeded, result_unknown]
+        messageId:
+          type: [string, "null"]
+          description: Present after the sent Gmail message has been reconciled.
+    MailSendOperationStatus:
+      type: object
+      required: [operationId, mailId, status, createdAt, updatedAt]
+      additionalProperties: false
+      properties:
+        operationId:
+          type: string
+          format: uuid
+        mailId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [prepared, draft_created, sending, reconciling, succeeded, result_unknown, failed_terminal]
+        messageId:
+          type: [string, "null"]
+        lastErrorCode:
+          type: [string, "null"]
+        nextAttemptAt:
+          type: [string, "null"]
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    RejectResponse:
+      type: object
+      required: [success, gmailMessageId]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        gmailMessageId:
+          type: string
+          description: >
+            Pseudonymous Gmail message ID of the original email. Return only
+            within the mail resource boundary; do not log or persist in event inbox.
+            The HUD uses this to open the email in Gmail so the user can write
+            a manual reply. HUD constructs the Gmail deep link as:
+            https://mail.google.com/mail/u/0/#inbox/{gmailMessageId}
+            This field is always present on successful rejection.
+        warning:
+          type: [string, "null"]
+          description: Present as draft_delete_failed when the reject request was processed but Gmail draft deletion may require manual confirmation.
+        correlationId:
+          type: [string, "null"]
+        manualAction:
+          type: [string, "null"]
+    CalendarRejectResponse:
+      type: object
+      required: [success, proposalId]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        proposalId:
+          type: string
+    CalendarCancelResponse:
+      type: object
+      required: [success, proposalId, mailStatus, gmailMessageId]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        proposalId:
+          type: string
+        mailStatus:
+          type: string
+          enum: [pending_reply_approval]
+          description: The source mail returns to reply-approval; the 2-hour claim timeout applies again.
+        gmailMessageId:
+          type: string
+          description: Pseudonymous Gmail message ID for manual navigation. Do not log or store in event inbox.
+    OperationAcceptedResponse:
+      type: object
+      required: [aggregateApprovalStatus]
+      additionalProperties: false
+      properties:
+        aggregateApprovalStatus:
+          type: string
+          enum: [pending_all, all_approved, any_rejected, selection_conflict]
+          description: >
+            Current aggregate approval state across all participants.
+            pending_all: still waiting for other participants.
+            all_approved: all approved, calendar operation enqueued (operationId present).
+            any_rejected: at least one rejected, alternative proposal flow triggered.
+            selection_conflict: two or more approved participants selected
+            different slots. Detected eagerly (D-35) without waiting for the
+            remaining participants, since unanimity is already impossible.
+        operationId:
+          type: string
+          description: Present only when aggregateApprovalStatus is all_approved.
+        status:
+          type: string
+          enum: [in_progress]
+          description: Present only when aggregateApprovalStatus is all_approved.
+    OperationStatus:
+      type: object
+      required: [operationId, status]
+      additionalProperties: false
+      properties:
+        operationId:
+          type: string
+        status:
+          type: string
+          enum: [dispatch_pending, in_progress, succeeded, partial_failed, failed, replan_required, result_unknown]
+        correlationId:
+          type: [string, "null"]
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttendeeOperationResult"
+        manualRemediationRequired:
+          type: boolean
+          default: false
+        error:
+          $ref: "#/components/schemas/ErrorResponse"
+    CreateFaqRequest:
+      type: object
+      required: [question, answer, piiReviewed]
+      additionalProperties: false
+      properties:
+        sourceMailId:
+          type: [string, "null"]
+        faqCandidateId:
+          type: [string, "null"]
+          description: Candidate being accepted; it is atomically marked accepted when supplied.
+        question:
+          type: string
+          minLength: 1
+        answer:
+          type: string
+          minLength: 1
+        piiReviewed:
+          type: boolean
+          const: true
+          description: Must be true after the user reviewed and removed PII in the HUD.
+    CreateFaqResponse:
+      type: object
+      required: [faqId, success]
+      additionalProperties: false
+      properties:
+        faqId:
+          type: string
+        success:
+          type: boolean
+    FaqCandidateDetail:
+      type: object
+      required: [faqCandidateId, sourceMailId, question, answer, expiresAt]
+      additionalProperties: false
+      properties:
+        faqCandidateId:
+          type: string
+        sourceMailId:
+          type: string
+        question:
+          type: string
+          description: PII-bearing candidate text requiring user review.
+        answer:
+          type: string
+          description: PII-bearing candidate text requiring user review.
+        expiresAt:
+          type: string
+          format: date-time
+    BusinessHours:
+      type: object
+      required: [timezone, days, start, end]
+      additionalProperties: false
+      properties:
+        timezone:
+          type: string
+          example: Asia/Tokyo
+        days:
+          type: array
+          items:
+            type: string
+            enum: [monday, tuesday, wednesday, thursday, friday]
+        start:
+          type: string
+          pattern: "^\\d{2}:\\d{2}$"
+        end:
+          type: string
+          pattern: "^\\d{2}:\\d{2}$"
+    SchedulingPolicy:
+      type: object
+      required:
+        - defaultDurationMinutes
+        - slotStepMinutes
+        - minimumNoticeMinutes
+        - contextWindowMinutes
+        - holidayMode
+        - timezoneResolution
+        - allDayEventMode
+        - transparentEventMode
+        - recurrenceMode
+        - dstMode
+        - tieBreakers
+      additionalProperties: false
+      allOf:
+        - if:
+            properties:
+              holidayMode:
+                const: configured_holiday_calendar
+            required: [holidayMode]
+          then:
+            required: [holidayCalendarRef]
+      properties:
+        defaultDurationMinutes:
+          type: integer
+          minimum: 15
+          maximum: 480
+          default: 60
+        slotStepMinutes:
+          type: integer
+          enum: [5, 10, 15, 30, 60]
+          default: 15
+        minimumNoticeMinutes:
+          type: integer
+          minimum: 0
+          maximum: 10080
+          default: 60
+        contextWindowMinutes:
+          type: integer
+          minimum: 0
+          maximum: 240
+          default: 15
+          description: Buffer applied before and after busy intervals.
+        holidayMode:
+          type: string
+          enum: [weekdays_only, configured_holiday_calendar]
+          default: weekdays_only
+        holidayCalendarRef:
+          type: string
+          minLength: 1
+          description: Pseudonymous configured calendar reference used only when holidayMode requires it.
+        timezoneResolution:
+          type: string
+          enum: [request_then_organization]
+          default: request_then_organization
+          description: Use an explicit request timezone, otherwise BusinessHours.timezone; never infer from server locale.
+        allDayEventMode:
+          type: string
+          enum: [busy]
+          default: busy
+        transparentEventMode:
+          type: string
+          enum: [ignore]
+          default: ignore
+        recurrenceMode:
+          type: string
+          enum: [expand_instances]
+          default: expand_instances
+        dstMode:
+          type: string
+          enum: [reject_nonexistent_prefer_earlier_offset]
+          default: reject_nonexistent_prefer_earlier_offset
+        tieBreakers:
+          type: array
+          minItems: 3
+          maxItems: 3
+          prefixItems:
+            - const: earliest_start
+            - const: least_context_switching
+            - const: lexical_slot_id
+          items: false
+          description: Fixed deterministic order; clients cannot reorder it.
+    PromptOverrides:
+      type: object
+      additionalProperties: false
+      properties:
+        classificationPrompt:
+          type: string
+          maxLength: 8000
+        draftPrompt:
+          type: string
+          maxLength: 8000
+        ragSystemPrompt:
+          type: string
+          maxLength: 8000
+        calendarPrompt:
+          type: string
+          maxLength: 8000
+    BusinessUnitMember:
+      type: object
+      required: [attendeeRef, titlePattern]
+      additionalProperties: false
+      properties:
+        attendeeRef:
+          type: string
+          format: uuid
+          description: Random UUID generated by the backend; it is never derived from a name or title.
+        titlePattern:
+          type: string
+          description: >
+            Calendar event title matching pattern used only for BU shared
+            calendar processing. Names derived from matching must be converted
+            immediately to attendeeRef and must not be stored in logs,
+            event_inbox, or timeline_events.
+        role:
+          type: [string, "null"]
+          description: Optional non-authoritative role label for future scoring.
+    BusinessUnit:
+      type: object
+      required: [businessUnitRef, name, calendarAccount, disabled, members]
+      additionalProperties: false
+      properties:
+        businessUnitRef:
+          type: string
+          format: uuid
+          description: Immutable backend-generated BU identifier used for authorization; names are not keys.
+        name:
+          type: string
+        calendarAccount:
+          type: string
+          format: email
+          description: >
+            BU shared Gmail and Calendar account. Must be included in
+            dwdAllowlistEmails before DwD access is allowed.
+        disabled:
+          type: boolean
+          description: Disabled units retain immutable identity and authorization history.
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/BusinessUnitMember"
+          default: []
+    BusinessUnitCreateRequest:
+      type: object
+      required: [name, calendarAccount]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        calendarAccount:
+          type: string
+          format: email
+    SettingsResponse:
+      type: object
+      required: [revision, settings]
+      additionalProperties: false
+      properties:
+        revision:
+          type: integer
+          minimum: 0
+        settings:
+          oneOf:
+            - $ref: "#/components/schemas/OpenClawSettings"
+            - $ref: "#/components/schemas/SettingsBootstrapState"
+    SettingsBootstrapState:
+      type: object
+      description: Returned only at revision 0 before the first full settings PUT.
+      required: [businessUnits]
+      additionalProperties: false
+      properties:
+        businessUnits:
+          type: array
+          readOnly: true
+          items:
+            $ref: "#/components/schemas/BusinessUnit"
+    SettingsUpdateResponse:
+      type: object
+      required: [success, revision]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        revision:
+          type: integer
+          minimum: 1
+    OpenClawSettings:
+      type: object
+      required: [organizationDomain, businessHours, schedulingPolicy, pollEnabled, faqCategories, dwdAllowlistEmails, businessUnits]
+      additionalProperties: false
+      properties:
+        organizationDomain:
+          type: string
+          description: Workspace domain used to identify internal attendees.
+        businessHours:
+          $ref: "#/components/schemas/BusinessHours"
+        schedulingPolicy:
+          $ref: "#/components/schemas/SchedulingPolicy"
+        pollEnabled:
+          type: boolean
+        faqCategories:
+          type: array
+          items:
+            type: string
+        promptOverrides:
+          $ref: "#/components/schemas/PromptOverrides"
+        dwdAllowlistEmails:
+          type: array
+          description: >
+            Domain-wide Delegation calendar write allowlist. Empty, missing,
+            or null values at the persistence layer are normalized to [] and
+            fail-closed: participant Calendar writes are skipped and manual
+            remediation is required. A target email must match both
+            organizationDomain and this allowlist to be writable.
+          items:
+            type: string
+            format: email
+          default: []
+        businessUnits:
+          type: array
+          description: >
+            Read-only projection of normalized business_units and active
+            business_unit_memberships. Manage it through admin business-unit
+            and user APIs; settings PUT cannot replace authorization data.
+          readOnly: true
+          items:
+            $ref: "#/components/schemas/BusinessUnit"
+          default: []
+    OpenClawSettingsUpdate:
+      type: object
+      required: [organizationDomain, businessHours, schedulingPolicy, pollEnabled, faqCategories, dwdAllowlistEmails]
+      additionalProperties: false
+      properties:
+        organizationDomain:
+          type: string
+        businessHours:
+          $ref: "#/components/schemas/BusinessHours"
+        schedulingPolicy:
+          $ref: "#/components/schemas/SchedulingPolicy"
+        pollEnabled:
+          type: boolean
+        faqCategories:
+          type: array
+          items:
+            type: string
+        promptOverrides:
+          $ref: "#/components/schemas/PromptOverrides"
+        dwdAllowlistEmails:
+          type: array
+          description: >
+            Domain-wide Delegation calendar write allowlist. Empty, missing,
+            or null values at the persistence layer are normalized to [] and
+            fail-closed: participant Calendar writes are skipped and manual
+            remediation is required. A target email must match both
+            organizationDomain and this allowlist to be writable.
+          items:
+            type: string
+            format: email
+          default: []
+    InternalJobAcceptedResponse:
+      type: object
+      required: [accepted, status]
+      additionalProperties: false
+      properties:
+        accepted:
+          type: boolean
+        status:
+          type: string
+          enum: [accepted, skipped]
+        correlationId:
+          type: [string, "null"]
+    InternalBatchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+    InternalBatchAcceptedResponse:
+      type: object
+      required: [accepted, status, processed]
+      additionalProperties: false
+      properties:
+        accepted:
+          type: boolean
+        status:
+          type: string
+          const: accepted
+        processed:
+          type: integer
+          minimum: 0
+    GmailPubsubPushRequest:
+      type: object
+      required: [message]
+      additionalProperties: true
+      properties:
+        message:
+          type: object
+          required: [data]
+          additionalProperties: true
+          properties:
+            data:
+              type: string
+              format: byte
+            messageId:
+              type: string
+    GmailNotificationAcceptedResponse:
+      type: object
+      required: [accepted, status, processed]
+      additionalProperties: false
+      properties:
+        accepted:
+          type: boolean
+          const: true
+        status:
+          type: string
+          enum: [succeeded, retry, ignored]
+        processed:
+          type: integer
+          minimum: 0
+    RetentionJobResponse:
+      type: object
+      required: [accepted, status, counts]
+      additionalProperties: false
+      properties:
+        accepted:
+          type: boolean
+        status:
+          type: string
+          const: accepted
+        counts:
+          type: object
+          required: [eventInboxDeleted, faqCandidatesDeleted, rejectionDetailsCleared, replyDraftsCleared, outboxDeleted]
+          additionalProperties: false
+          properties:
+            eventInboxDeleted:
+              type: integer
+              minimum: 0
+            faqCandidatesDeleted:
+              type: integer
+              minimum: 0
+            rejectionDetailsCleared:
+              type: integer
+              minimum: 0
+            replyDraftsCleared:
+              type: integer
+              minimum: 0
+            outboxDeleted:
+              type: integer
+              minimum: 0
+    CalendarOperationExecutionResponse:
+      type: object
+      required: [accepted, status, operationId]
+      additionalProperties: false
+      properties:
+        accepted:
+          type: boolean
+        status:
+          type: string
+          description: >
+            Calendar worker execution status. `succeeded` means all participant
+            writes completed and participant-level success results were
+            persisted. `replan_required` means execution-time validation found
+            a stale slot/revision/ETag and no new write was attempted.
+            `failed_recorded` and `partial_failed_recorded` are terminal because
+            participant-level results were persisted. Transient failures are
+            represented by non-2xx responses and retried by Cloud Tasks.
+          enum: [accepted, skipped, already_completed, succeeded, replan_required, partial_failed_recorded, failed_recorded]
+        operationId:
+          type: string
+        correlationId:
+          type: [string, "null"]
+    ClaimResponse:
+      type: object
+      required: [success, mailId, claimedAt, cardVersion, detailAvailable]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        mailId:
+          type: string
+        claimedAt:
+          type: string
+          format: date-time
+        cardVersion:
+          type: integer
+          description: Version after binding the claimant and issuing the first token.
+        detailAvailable:
+          type: boolean
+          const: true
+          description: The claimant may now fetch the token-bearing detail card.
+    ClaimEventPayload:
+      type: object
+      description: >
+        Broadcast notification for claim acquisition (mail_claimed),
+        release (mail_unclaimed), or transfer (mail_transferred).
+        Sent to all BU members via event_inbox_recipients rows. Contains only
+        pseudonymous IDs and no direct identifiers or mail content.
+      required: [mailId, claimerAttendeeRef]
+      additionalProperties: false
+      properties:
+        mailId:
+          type: string
+        claimerAttendeeRef:
+          type: [string, "null"]
+          description: >
+            attendee_ref of the new claim holder.
+            null for mail_unclaimed (no one holds the claim after release).
+        claimedAt:
+          type: [string, "null"]
+          format: date-time
+          description: Timestamp of the new claim. null for mail_unclaimed.
+    TransferTargetListResponse:
+      type: object
+      required: [targets]
+      additionalProperties: false
+      properties:
+        targets:
+          type: array
+          items:
+            type: object
+            required: [attendeeRef, label]
+            additionalProperties: false
+            properties:
+              attendeeRef:
+                type: string
+                format: uuid
+              label:
+                type: string
+                description: Non-email organizational label such as title pattern or role.
+    TransferRequest:
+      type: object
+      required: [targetAttendeeRef]
+      additionalProperties: false
+      properties:
+        targetAttendeeRef:
+          type: string
+          description: >
+            attendee_ref of the BU member to receive the claim.
+            Must be a member of the same BU as the current claimer; cross-BU returns 400.
+    TransferResponse:
+      type: object
+      required: [success, mailId, cardVersion, detailAvailable]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        mailId:
+          type: string
+        cardVersion:
+          type: integer
+          description: Incremented card version after approvalToken reissue.
+        detailAvailable:
+          type: boolean
+          description: >
+            True only when a stale-claim force transfer targets the caller.
+            Otherwise the transferor loses detail/token access and the target
+            claimant fetches the current detail card independently.
+    TicketItem:
+      type: object
+      description: >
+        Lightweight ticket entry for the HUD ticket board (v2). `subject` is
+        PII and is returned only within the resource authorization boundary;
+        responses are Cache-Control: no-store and must not be logged.
+        bodyPreview and replyDraft are excluded; fetch
+        GET /v1/mail/{mailId}/detail on demand.
+      required: [mailId, status, claimerAttendeeRef, claimedAt, claimState, subject, urgency, receivedAt, cardVersion]
+      additionalProperties: false
+      properties:
+        mailId:
+          type: string
+        status:
+          type: string
+          enum: [未対応, pending_calendar, pending_reply_approval, draft_missing, 対応中, 回答済み, 解決済み, 保留]
+        claimerAttendeeRef:
+          type: [string, "null"]
+          description: attendee_ref of the current claim holder. null if unclaimed.
+        claimedAt:
+          type: [string, "null"]
+          format: date-time
+        claimState:
+          type: string
+          enum: [unclaimed, mine, other]
+          description: Caller-relative claim ownership without exposing the caller identifier.
+        subject:
+          type: string
+        urgency:
+          type: string
+          enum: [high, medium, low, none]
+        category:
+          type: [string, "null"]
+        receivedAt:
+          type: string
+          format: date-time
+        cardVersion:
+          type: integer
+    TicketListResponse:
+      type: object
+      required: [tickets]
+      additionalProperties: false
+      properties:
+        tickets:
+          type: array
+          items:
+            $ref: "#/components/schemas/TicketItem"
+        nextCursor:
+          type: [string, "null"]
+    MailDetailResponse:
+      type: object
+      description: >
+        Full mail approval card returned by GET /v1/mail/{mailId}/detail.
+        For the personal owner/current claimant it can contain bodyPreview,
+        replyDraft, and short-lived approvalToken. Other active members of the
+        same BU receive metadata with those fields null. It must not be stored
+        in event_inbox or logs; renderer IPC must not persist sensitive fields.
+      required:
+        - mailId
+        - cardVersion
+        - cardType
+        - canApprove
+        - claimRequired
+        - analysisStatus
+        - subject
+        - senderDisplayName
+        - urgency
+        - summary
+        - intent
+        - actions
+      additionalProperties: false
+      properties:
+        mailId:
+          type: string
+        cardVersion:
+          type: integer
+        approvalToken:
+          type: [string, "null"]
+          description: >
+            Short-lived plaintext approvalToken for the personal owner or
+            current BU claimant only. Null for unclaimed/manual/bounce cards.
+        tokenExpiresAt:
+          type: [string, "null"]
+          format: date-time
+        cardType:
+          type: string
+          enum: [approval_ready, manual_action_required, bounce_notice]
+        canApprove:
+          type: boolean
+        claimRequired:
+          type: boolean
+        analysisStatus:
+          type: string
+          enum: [succeeded, failed, skipped_bounce]
+        failureReasonCode:
+          type: [string, "null"]
+          enum: [null, model_unavailable, invalid_model_output, unsafe_content, draft_generation_failed]
+        subject:
+          type: string
+        senderDisplayName:
+          type: string
+        urgency:
+          type: string
+          enum: [high, medium, low, none]
+        category:
+          type: [string, "null"]
+        bodyPreview:
+          type: [string, "null"]
+          description: >
+            [PII] First 500 characters for the personal owner/current claimant;
+            null for an authorized BU member who is not the claimant.
+        summary:
+          type: string
+        intent:
+          type: string
+        actions:
+          type: array
+          items:
+            type: string
+        replyDraft:
+          type: [string, "null"]
+          description: >
+            Full AI-generated draft only for an authorized approval_ready card;
+            null when generation failed or the caller is not the claimant.
+        claimerAttendeeRef:
+          type: [string, "null"]
+          description: attendee_ref of the current claim holder. null if unclaimed.
+        claimedAt:
+          type: [string, "null"]
+          format: date-time
+          description: Timestamp of the current claim. null if unclaimed.
+        calendarProposals:
+          type: array
+          items:
+            $ref: "#/components/schemas/CalendarProposal"
+    AdminUserCreateRequest:
+      type: object
+      description: >
+        Request to pre-register a BU user and membership atomically. The backend
+        stores only sha256(normalized email), creates attendeeRef, and binds the
+        Google subject once on the matching user's first login.
+      required: [email, businessUnitRef]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+        businessUnitRef:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [member, manager, faq_reviewer]
+          default: member
+    AdminUserCreateResponse:
+      type: object
+      required: [success, userId, attendeeRef, provisioningStatus]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        userId:
+          type: string
+          description: Opaque internal user ID (UUID). Non-PII.
+        attendeeRef:
+          type: string
+          format: uuid
+          description: Backend-generated pseudonymous participant reference.
+        provisioningStatus:
+          type: string
+          enum: [pending_subject_bind, active]
+    GmailSelfRegistrationResponse:
+      type: object
+      required: [success, attendeeRef, workspaceAccessType]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        attendeeRef:
+          type: string
+          description: Pseudonymous attendee_ref assigned to the personal Workspace user.
+        workspaceAccessType:
+          type: string
+          enum: [personal_oauth]
+    SubjectBindResponse:
+      type: object
+      required: [success, userId, attendeeRef]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        userId:
+          type: string
+          format: uuid
+        attendeeRef:
+          type: string
+          format: uuid
+    ErrorResponse:
+      type: object
+      required: [code, message, correlationId]
+      additionalProperties: false
+      properties:
+        code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+          maxLength: 200
+          description: Safe user-facing message only. Raw exception text, stack traces, HTTP headers, request/response bodies, tokens, API keys, secret resource names, and PII are prohibited.
+        correlationId:
+          type: string
+        details:
+          description: Sanitized structured validation details. Never contains request values or PII.
+          type: array
+          items:
+            type: object
+            required: [path, keyword, message, params]
+            additionalProperties: false
+            properties:
+              path:
+                type: string
+              keyword:
+                type: string
+              message:
+                type: string
+              params:
+                type: object
+                additionalProperties: true
+        supersededByProposalId:
+          type: [string, "null"]
+          description: >
+            Present only when code is proposal_superseded. The current proposal
+            revision the HUD should switch to. Null when the proposal was
+            cancelled rather than superseded (D-35).
+    ErrorCode:
+      type: string
+      enum:
+        - invalid_request
+        - validation_error
+        - unauthorized
+        - forbidden
+        - stale_card_version
+        - invalid_approval_token
+        - rate_limited
+        - bootstrap_required
+        - oauth_session_expired
+        - oauth_exchange_failed
+        - refresh_token_missing
+        - refresh_token_invalid
+        - operation_conflict
+        - replan_required
+        - external_result_unknown
+        - proposal_superseded
+        - pii_review_required
+        - endpoint_not_configured
+        - db_unavailable
+        - service_unavailable
+        - internal_error
+        - rate_limit_exceeded  # Backward-compatible alias. Prefer rate_limited for MVP 429 responses.
+    HealthErrorResponse:
+      type: object
+      required:
+        - status
+        - detail
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [error]
+          description: ヘルスチェックエラー状態
+        detail:
+          type: string
+          enum: [db_unavailable]
+          description: エラー詳細コード
+      example:
+        status: error
+        detail: db_unavailable
+  responses:
+    ProbeUnavailable:
+      description: Platform readiness probe failed with coarse non-sensitive status only.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [status, timestamp]
+            additionalProperties: false
+            properties:
+              status:
+                type: string
+                enum: [unavailable]
+              timestamp:
+                type: string
+                format: date-time
+    BadRequest:
+      description: Invalid request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Missing or invalid Google ID/OIDC token. The HUD must not retry. OpenClaw returns ErrorResponse when application-level token validation fails.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Forbidden:
+      description: Authenticated but not authorized by hosted domain, OAuth client ID, subject, or service-account allowlist. The HUD must not retry.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Requested resource was not found or is no longer available.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalUnauthorized:
+      description: Missing or invalid OIDC token for an internal Cloud Scheduler / Cloud Tasks caller. Treat as IAM/OIDC configuration failure and alert; this is not a HUD retry condition.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalForbidden:
+      description: Internal caller authenticated but not authorized. Treat as IAM binding failure and alert; this is not a HUD retry condition.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: "Stale cardVersion (code: stale_card_version), invalid or expired approvalToken (code: invalid_approval_token), or operation conflict (code: operation_conflict)."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    TooManyRequests:
+      description: Rate limit exceeded. HUD should back off using Retry-After and must not auto-retry side-effect operations without refetching current card state.
+      headers:
+        Retry-After:
+          description: Required. Seconds until this operation may be retried.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/ErrorResponse"
+              - type: object
+                required: [code]
+                properties:
+                  code:
+                    const: rate_limited
+          examples:
+            rateLimited:
+              value:
+                code: rate_limited
+                message: "Rate limit exceeded. Retry after the indicated delay."
+                correlationId: "00000000-0000-0000-0000-000000000000"
+    InternalError:
+      description: Internal service error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ServiceUnavailable:
+      description: Service unavailable, including Cloud SQL connectivity failure.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/HealthErrorResponse"
